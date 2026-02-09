@@ -132,6 +132,20 @@ class GetSenderInfoReq(BaseModel):
     chat_id: Union[str, int]
     message_id: int
 
+# ==================== НОВАЯ МОДЕЛЬ: Добавление пользователя в канал ====================
+class AddToChannelReq(BaseModel):
+    account: str
+    channel_username: str  # или channel_id
+    user_username: str    # юзернейм пользователя для добавления
+    role: str = "member"  # member, admin, moderator
+    custom_title: Optional[str] = None  # для администраторов
+
+# ==================== НОВАЯ МОДЕЛЬ: Проверка участника канала ====================
+class CheckChannelMemberReq(BaseModel):
+    account: str
+    channel_username: str
+    user_username: str
+
 # ==================== Вспомогательные функции ====================
 def extract_folder_title(folder_obj):
     if not hasattr(folder_obj, 'title'):
@@ -941,6 +955,210 @@ async def send_contact_simple(req: SendContactReq):
     except Exception as e:
         error_msg = str(e)
         raise HTTPException(500, detail=f"Ошибка отправки контакта: {error_msg}")
+
+
+# ==================== НОВЫЙ ЭНДПОИНТ: Добавить пользователя в канал ====================
+@app.post("/channel/add_user")
+async def add_user_to_channel(req: AddToChannelReq):
+    """
+    Добавить пользователя в канал по юзернейму.
+    
+    Параметры:
+    - account: имя аккаунта бота
+    - channel_username: @username или ID канала
+    - user_username: @username пользователя для добавления
+    - role: "member", "admin", "moderator"
+    - custom_title: кастомный титул для администратора
+    """
+    client = ACTIVE_CLIENTS.get(req.account)
+    if not client:
+        raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
+
+    try:
+        # 1. Получаем сущность канала
+        print(f"🔍 Ищу канал: {req.channel_username}")
+        try:
+            if req.channel_username.startswith('@'):
+                channel = await client.get_entity(req.channel_username)
+            elif req.channel_username.lstrip('-').isdigit():
+                channel = await client.get_entity(int(req.channel_username))
+            else:
+                # Пробуем как username без @
+                channel = await client.get_entity(f"@{req.channel_username}")
+        except Exception as e:
+            raise HTTPException(400, detail=f"Канал не найден: {str(e)}")
+
+        # Проверяем, что это действительно канал
+        if not hasattr(channel, 'broadcast'):
+            raise HTTPException(400, detail="Указанная сущность не является каналом")
+
+        # 2. Получаем сущность пользователя
+        print(f"🔍 Ищу пользователя: {req.user_username}")
+        try:
+            if req.user_username.startswith('@'):
+                user = await client.get_entity(req.user_username)
+            else:
+                # Пробуем как username без @
+                user = await client.get_entity(f"@{req.user_username}")
+        except Exception as e:
+            raise HTTPException(400, detail=f"Пользователь не найден: {str(e)}")
+
+        # Проверяем, что это пользователь
+        if not hasattr(user, 'first_name'):
+            raise HTTPException(400, detail="Указанная сущность не является пользователем")
+
+        print(f"✅ Найдены: Канал '{channel.title}', Пользователь '{user.first_name}'")
+
+        # 3. Подготавливаем параметры в зависимости от роли
+        admin_rights = None
+        if req.role in ["admin", "moderator"]:
+            # Определяем права администратора
+            admin_rights = types.ChatAdminRights(
+                change_info=True,      # Изменение информации о канале
+                post_messages=True,    # Публикация сообщений
+                edit_messages=True,    # Редактирование сообщений
+                delete_messages=True,  # Удаление сообщений
+                ban_users=True,        # Бан пользователей
+                invite_users=True,     # Приглашение пользователей
+                pin_messages=True,     # Закрепление сообщений
+                add_admins=True,       # Добавление администраторов
+                anonymous=False,       # Анонимный режим
+                manage_call=False,     # Управление звонками (для групп)
+                other=True,            # Другие права
+                manage_topics=False    # Управление темами
+            )
+
+        # 4. Добавляем пользователя в канал
+        print(f"➕ Добавляю пользователя в канал...")
+        
+        try:
+            if req.role in ["admin", "moderator"]:
+                # Добавляем как администратора
+                result = await client(functions.channels.EditAdminRequest(
+                    channel=channel,
+                    user_id=user.id,
+                    admin_rights=admin_rights,
+                    rank=req.custom_title or ("Администратор" if req.role == "admin" else "Модератор")
+                ))
+                print(f"✅ Пользователь добавлен как {req.role}")
+            else:
+                # Добавляем как обычного участника
+                result = await client(functions.channels.InviteToChannelRequest(
+                    channel=channel,
+                    users=[user]
+                ))
+                print(f"✅ Пользователь добавлен как участник")
+        
+        except Exception as e:
+            error_msg = str(e)
+            if "USER_ALREADY_PARTICIPANT" in error_msg:
+                raise HTTPException(400, detail="Пользователь уже является участником канала")
+            elif "USER_PRIVACY_RESTRICTED" in error_msg:
+                raise HTTPException(403, detail="Пользователь ограничил приглашения в каналы")
+            elif "CHAT_ADMIN_REQUIRED" in error_msg:
+                raise HTTPException(403, detail="У аккаунта нет прав администратора в канале")
+            elif "USER_NOT_MUTUAL_CONTACT" in error_msg:
+                raise HTTPException(400, detail="Пользователь не является взаимным контактом")
+            elif "USER_KICKED" in error_msg:
+                raise HTTPException(400, detail="Пользователь был забанен в канале")
+            elif "USERS_TOO_MUCH" in error_msg:
+                raise HTTPException(400, detail="Превышен лимит участников в канале")
+            else:
+                raise HTTPException(500, detail=f"Ошибка добавления: {error_msg}")
+
+        return {
+            "status": "success",
+            "account": req.account,
+            "channel": {
+                "id": channel.id,
+                "title": getattr(channel, 'title', ''),
+                "username": getattr(channel, 'username', '')
+            },
+            "user": {
+                "id": user.id,
+                "first_name": getattr(user, 'first_name', ''),
+                "last_name": getattr(user, 'last_name', ''),
+                "username": getattr(user, 'username', '')
+            },
+            "role": req.role,
+            "custom_title": req.custom_title,
+            "timestamp": datetime.now().isoformat(),
+            "message": f"Пользователь @{getattr(user, 'username', '')} успешно добавлен в канал"
+        }
+
+    except PeerIdInvalidError:
+        raise HTTPException(400, detail="Неверный ID канала или пользователя")
+    except FloodWaitError as e:
+        raise HTTPException(429, detail=f"Ограничение Telegram: подождите {e.seconds} секунд")
+    except Exception as e:
+        error_msg = str(e)
+        print(f"❌ Ошибка добавления в канал: {error_msg}")
+        raise HTTPException(500, detail=f"Ошибка: {error_msg}")
+
+
+# ==================== НОВЫЙ ЭНДПОИНТ: Проверить участника канала ====================
+@app.post("/channel/check_member")
+async def check_channel_member(req: CheckChannelMemberReq):
+    """Проверить, является ли пользователь участником канала"""
+    client = ACTIVE_CLIENTS.get(req.account)
+    if not client:
+        raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
+
+    try:
+        # Получаем сущность канала
+        if req.channel_username.startswith('@'):
+            channel = await client.get_entity(req.channel_username)
+        else:
+            channel = await client.get_entity(f"@{req.channel_username}")
+
+        # Получаем сущность пользователя
+        if req.user_username.startswith('@'):
+            user = await client.get_entity(req.user_username)
+        else:
+            user = await client.get_entity(f"@{req.user_username}")
+
+        # Получаем участников канала
+        participants = await client.get_participants(channel)
+        
+        is_member = any(p.id == user.id for p in participants)
+        is_admin = False
+        admin_title = None
+        
+        if is_member:
+            # Проверяем, является ли администратором
+            for p in participants:
+                if p.id == user.id:
+                    if hasattr(p, 'participant'):
+                        participant = p.participant
+                        if hasattr(participant, 'admin_rights') and participant.admin_rights:
+                            is_admin = True
+                            admin_title = getattr(participant, 'rank', None)
+                            break
+                    elif hasattr(p, 'admin_rights') and p.admin_rights:
+                        is_admin = True
+                        admin_title = getattr(p, 'admin_title', None)
+                        break
+
+        return {
+            "status": "success",
+            "is_member": is_member,
+            "is_admin": is_admin,
+            "admin_title": admin_title,
+            "channel": {
+                "id": channel.id,
+                "title": getattr(channel, 'title', ''),
+                "username": getattr(channel, 'username', '')
+            },
+            "user": {
+                "id": user.id,
+                "username": getattr(user, 'username', ''),
+                "first_name": getattr(user, 'first_name', ''),
+                "last_name": getattr(user, 'last_name', '')
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(500, detail=f"Ошибка проверки: {str(e)}")
    
 # ==================== Остальные эндпоинты (без изменений) ====================
 async def incoming_handler(event):
